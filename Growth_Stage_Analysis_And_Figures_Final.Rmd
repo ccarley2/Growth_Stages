@@ -1,0 +1,857 @@
+---
+title: "Growth_Stage_Analysis"
+author: "Clayton Carley"
+date: '2022-06-14'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Load libraries
+
+```{r, load}
+library(readxl)
+library(lme4)
+library(multcomp)
+library(ggplot2)
+library(ggpubr)
+library(referenceIntervals)
+library(data.table)
+library(esquisse)
+library(dplyr)
+library(writexl)
+library(GGally)
+library(BiocManager)
+library(statgenGxE)
+library(emmeans)
+library(cowplot)
+library(knitr)
+library(emmeans) #estimated marginal means (Same as LS Means)
+library(lmerTest)
+library(tidyverse)
+library(grid)
+library(gridExtra) 
+library(agricolae)
+library("Hmisc")
+library(corrplot)
+library("plotrix")
+library(ggResidpanel)
+library(multcompView)
+library(naniar)
+library(metan)
+```
+
+```{r Data sources}
+setwd("G:/My Drive/Clayton Carley Lab Book/SNAP/Growth Stage Paper/Growth_Stages")
+
+#Sizes per nodule
+nods <- read_excel("Growth_Stage_Paper_Data.xlsx", sheet = "All_Nod_Distributions", na = "N/A")
+
+#Counts per root
+Counts <- read_excel("Growth_Stage_Paper_Data.xlsx", sheet = "Nod_Dist_Summary_Per_Root", na = "N/A")
+
+roots <- subset(Counts, select = -c(`whole_wet_plant_mass(g)`, `Heigth_Shoot(cm)`))
+
+roots[1:13] <- lapply(roots[1:13], factor)
+
+roots$FarmYearTime <- paste(roots$FarmYear, roots$Time)
+
+roots$FarmYearTime <- as.factor(roots$FarmYearTime)
+
+str(roots)
+
+
+#Nitrogen datasheet
+ELN <- read_excel("Growth_Stage_Paper_Data.xlsx", sheet = "Elemental_Analysis", 
+    col_types = c("text", "numeric", "text", 
+        "text", "text", "text", "text", "text", 
+        "numeric", "numeric", "text", "text", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "text", "numeric", "text", 
+        "text", "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric"), 
+    na = "NA")
+
+rm(Counts, nods)
+
+roots$FarmYear <- as.character(roots$FarmYear)
+roots$FarmYear[roots$FarmYear=='fmy18'] <- "S2"
+roots$FarmYear[roots$FarmYear=='fmy19'] <- "S3"
+roots$FarmYear[roots$FarmYear=='fhy18'] <- "S1"
+
+```
+
+## Outlier Removal
+
+```{r outlier removal} 
+#Actually remove outliers. Started with 542 observations, ended with 533 and added Nas for biomasses 
+
+#use models to find outliers. 
+allnods1 <- lmer(log(total_nods) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+
+roots$allnodresid <- stats::rstudent(allnods1)
+
+tap1 <- lmer(log(on_tap_root+1) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+
+roots$tapstudentresid <- stats::rstudent(tap1)
+
+Shoot1 <- lmer(log(`Shoot_Dry_Mass(g)`) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots, na.action=na.exclude)
+
+roots$shoottudentresid <- stats::rstudent(Shoot1, na.action=na.exclude)
+
+
+
+rootbiomassM <- lmer(log(`Root_Dry_Mass(g)`) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots, na.action=na.exclude)
+
+roots <- roots %>% add_column(biomasresid = NA)
+
+roots$biomasresid <- stats::rstudent(rootbiomassM, na.action=na.exclude)
+
+roots <- roots %>% add_column(LogRootDryMass = NA)
+roots$LogRootDryMass <- log(roots$`Root_Dry_Mass(g)`)
+
+
+
+TapNodAreaM <- lmer(log(TapNodVol) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots, na.action=na.exclude)
+
+
+roots$TapVolResid <- stats::rstudent(TapNodAreaM)
+
+
+SecNodAreaM <- lmer(log(SecNodVol) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots, na.action=na.exclude)
+
+
+roots$secVolResid <- stats::rstudent(SecNodAreaM, na.action=na.exclude)
+
+
+TotNodAreaM <- lmer(log(Total_Nod_Vol) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+
+
+roots$TotalVolResid <- stats::rstudent(TotNodAreaM)
+
+
+#Remove outliers in the roots sheet
+roots <- subset(roots, roots$allnodresid >= -3.23)
+roots <- subset(roots, roots$tapstudentresid >= -3.23)
+
+is.na(roots$`Root_Dry_Mass(g)`) <- roots$biomasresid < -3.23
+is.na(roots$`Root_Dry_Mass(g)`) <- roots$biomasresid > 3.23
+
+is.na(roots$`Shoot_Dry_Mass(g)`) <- roots$`Shoot_Dry_Mass(g)` > 9
+is.na(roots$`Shoot_Dry_Mass(g)`) <- roots$shoottudentresid < -3.23
+
+is.na(roots$TapNodVol) <- roots$TapVolResid < -3.23
+is.na(roots$TapNodVol) <- roots$TapVolResid > 3.23
+
+is.na(roots$SecNodVol) <- roots$secVolResid < -3.23
+is.na(roots$SecNodVol) <- roots$secVolResid > 3.23
+
+is.na(roots$Total_Nod_Vol) <- roots$TotalVolResid < -3.23
+is.na(roots$Total_Nod_Vol) <- roots$TotalVolResid > 3.23
+
+```
+
+## ANOVA
+
+```{r Table 1}
+TapNods <-  lmer(log(on_tap_root+1) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(TapNods, ddf = "Ken")
+
+
+SecNods <-  lmer(log(sec_nods+1) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(SecNods, ddf = "Ken")
+```
+
+## Figure 1 
+
+```{r Figure 1}
+
+#1a #has y log scale change 
+fig1a <- ggplot(roots) +
+  aes(x = Time, y = total_nods, fill = FarmYear) +
+  geom_boxplot(position = position_dodge(width = .8)) +
+  stat_boxplot(geom = 'errorbar', position = position_dodge(width = .8), width = .1) + 
+  ylab("Total Nodules") + xlab("Growth Stage") + 
+  ggtitle("Total Nodules Per Growth \nStage At Each Environment") + 
+  scale_y_continuous(trans='log', breaks=c(2, 7, 20, 54, 148)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(fill = "Environment") + 
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_discrete(name = "Environment", labels = c("S1", "S2", "S3"))
+
+#1b
+fig1b <- ggplot(roots) +
+  aes(x = Time, y = on_tap_root, fill = FarmYear) +
+  geom_boxplot(position = position_dodge(width = .8)) +
+  stat_boxplot(geom = 'errorbar', position = position_dodge(width = .8), width = .1) + 
+  ylab("Taproot Nodules") + xlab("Growth Stage") + 
+  ggtitle("Taproot Nodules Per Growth \nStage At Each Environment") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(trans='log', breaks=c(2, 7, 20)) +
+  labs(fill = "Environment") + 
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_discrete(name = "Environment", labels = c("S1", "S2", "S3"))
+
+#1c
+fig1c <- ggplot(roots) +
+  aes(x = Time, y = `Root_Dry_Mass(g)`, fill = FarmYear) +
+  geom_boxplot(position = position_dodge(width = .8)) +
+  stat_boxplot(geom = 'errorbar', position = position_dodge(width = .8), width = .1) + 
+  ylab("Dry Root Mass (g)") + xlab("Growth Stage") + 
+  ggtitle("Dry Root Biomass Per Growth \nStage At Each Environment") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(trans='log', breaks=c(.05, .13, .37, 1.00, 2)) +
+  labs(fill = "Environment") + 
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_discrete(name = "Environment", labels = c("S1", "S2", "S3"))
+
+fig1c1 <- ggplot(roots) +
+  aes(x = Time, y = `Root_Dry_Mass(g)`, fill = FarmYear) +
+  geom_boxplot(position = position_dodge(width = .8)) +
+  stat_boxplot(geom = 'errorbar', position = position_dodge(width = .8), width = .1) + 
+  ylab("Dry Root Mass (g)") + xlab("Growth Stage") + 
+  ggtitle("Dry Root Biomass Per Growth \nStage At Each Environment") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(fill = "Environment") + 
+  theme_bw() +
+  scale_fill_discrete(name = "Environment", labels = c("S1", "S2", "S3"))
+
+legendfig1 <- get_legend(fig1c1)
+
+Figure1 <- plot_grid(fig1a, fig1b, fig1c, legendfig1, labels = c('A', 'B', 'C'), nrow = 2) 
+
+Figure1
+
+ggsave("Figure1.emf", width = 8, height = 5, device = {function(filename, ...) devEMF::emf(file = filename, ...)})
+
+```
+
+## Tables 2-5
+
+```{r generate means and SEs}
+
+#all nods, Taproot, Nodule Mass, Root Biomass, Shoot Biomass, nod area, tap nod area, sec nod area, tot nod area, tot tap area, tot sec nod area. 
+
+roots.traits.avg <- aggregate(list(roots$total_nods, roots$on_tap_root, roots$`N_Mass(g)`, roots$`Root_Dry_Mass(g)`, roots$`Shoot_Dry_Mass(g)`, roots$all_avg_size_mm, roots$tap_Avg_size_mm, roots$sec_Avg_Size_mm, roots$Total_Nod_Vol, roots$TapNodVol, roots$SecNodVol ), by = list( roots$FarmYear,roots$Genotype, roots$Time), mean, na.rm = TRUE)
+
+
+#Calculate Standard Errors
+
+st.err3 <- function(x) {
+    sd(x, na.rm=TRUE)/sqrt(length(x)-(sum(is.na(x))))
+     }
+
+st.err4 <- function(x) {
+    sd(x)/sqrt(length(x))
+     }
+
+roots.traits.SE <- aggregate(list(roots$total_nods, roots$on_tap_root, roots$`N_Mass(g)`, roots$`Root_Dry_Mass(g)`, roots$`Shoot_Dry_Mass(g)`, roots$all_avg_size_mm, roots$tap_Avg_size_mm, roots$sec_Avg_Size_mm, roots$Total_Nod_Vol, roots$TapNodVol, roots$SecNodVol ), by = list( roots$FarmYear,roots$Genotype, roots$Time), st.err3)
+
+
+#seed N, seed C, Seed Cwt, 
+
+seed.traits.avg <- aggregate(list(roots$Ncont, roots$Ccont, roots$Cwt), by = list( roots$FarmYear,roots$Genotype), mean, na.rm = TRUE)
+seed.traits.SE <- aggregate(list(roots$Ncont, roots$Ccont, roots$Cwt), by = list( roots$FarmYear), st.err4)
+```
+
+## Figure 2
+
+```{r Figure 2}
+
+#2a
+Nod_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(total_nods),.groups = "keep")
+
+figa <- ggplot(Nod_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab("Total Nodules") + xlab("Growth Stage") +
+  ggtitle("Nodule Count") +
+  scale_y_continuous(trans='log', breaks=c(31, 40, 54, 76, 109, 148)) +
+  theme_bw() +
+  theme(legend.position = "none") 
+
+
+#Generate legend 
+figa.1 <- ggplot(Nod_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab("Total Nodules") + xlab("Growth Stage") +
+  ggtitle("Avg Nodule Count") +
+  scale_y_continuous(trans='log') +
+  theme_bw() +
+  theme(legend.direction="horizontal")
+ 
+#2b
+NodSize_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(all_avg_size_mm),.groups = "keep")
+
+figb <- ggplot(NodSize_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab(bquote(Nodule~Area~(mm^2))) + xlab("Growth Stage") +
+  ggtitle("Area Per Nodule") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+#2c
+NodVol_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(Total_Nod_Vol, na.rm=TRUE),.groups = "keep")
+
+figc <- ggplot(NodVol_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab(bquote(Nodule~Area~(mm^2))) + xlab("Growth Stage") +
+  ggtitle("Total Nodule Area") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+
+#2d
+Tap_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(on_tap_root),.groups = "keep")
+
+figd <- ggplot(Tap_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab("Taproot Nodules") + xlab("Growth Stage") +
+  ggtitle("Taproot Nodule Count") + 
+  scale_y_continuous(trans='log') +
+  theme_bw() +
+  theme(legend.position = "none")
+
+#2e
+Tap_Means_mm <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(tap_Avg_size_mm,na.rm=TRUE), .groups = "keep")
+
+fige <- ggplot(Tap_Means_mm)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab(bquote(Nodule~Area~(mm^2))) + xlab("Growth Stage") +
+  ggtitle("Area Per Taproot Nodule") + 
+   scale_y_continuous(trans='log') +
+  theme_bw() +
+  theme(legend.position = "none")
+
+#2f
+Tap_NodVol_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(TapNodVol, na.rm=TRUE),.groups = "keep")
+
+
+figf <- ggplot(Tap_NodVol_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  xlab("Growth Stage") +
+  ylab(bquote(Nodule~Area~(mm^2))) + xlab("Growth Stage") +
+  ggtitle("Taproot Nodule Area") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+#2g
+sec_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(sec_nods),.groups = "keep")
+
+figg <- ggplot(sec_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab("Non-Tapoot Nodules") + xlab("Growth Stage") +
+  ggtitle("Non-Tapoot Nodule Count") + 
+  scale_y_continuous(trans='log', breaks=c(20, 54, 148)) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+#2h
+sec_Means_mm <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(sec_Avg_Size_mm, na.rm=TRUE), .groups = "keep")
+
+figh <- ggplot(sec_Means_mm)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  ylab(bquote(Nodule~Area~(mm^2))) + xlab("Growth Stage") +
+  ggtitle("Area Per Non-Taproot Nodule") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+#2i
+sec_NodVol_Means <- roots %>% group_by(Genotype, Time)  %>% summarise(MeanValue = mean(SecNodVol, na.rm=TRUE),.groups = "keep")
+
+
+figi <- ggplot(sec_NodVol_Means)+
+  aes(x=Time, y=MeanValue, group = Genotype) +
+  geom_line(aes(color=Genotype)) +
+  geom_point(aes(color=Genotype)) +
+  xlab("Growth Stage") +
+  ylab(bquote(Nodule~Area~(mm^2))) + xlab("Growth Stage") +
+  ggtitle("Non-Taproot Nodule Area") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+legend <- get_legend(figa.1)
+
+Figure2 <- plot_grid(figa, figb, figc, figd, fige, figf, figg, figh, figi, align = "hv", labels = c("AUTO"), nrow = 3) 
+
+legend <- plot_grid(legend,nrow = 1)
+
+Figure2
+
+```
+
+## Tables 6 and 7
+
+```{r Table 6}
+
+TapNods <-  lmer(log(on_tap_root+1) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(TapNods, ddf = "Ken")
+
+
+tap.geno.emm.by.Time = emmeans(TapNods, ~ Genotype|Time)
+
+ComparisonsTable.tap <- as.data.frame(pwpm(tap.geno.emm.by.Time))
+
+ComparisonsTable.tap
+
+multcomp::cld(tap.geno.emm.by.Time)
+```
+
+```{r Table 7}
+
+library(multcompView)
+
+SecNods <-  lmer(log(sec_nods+1) ~ Genotype*FarmYear*Time +  (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots, na.action=na.exclude)
+
+anova(SecNods, ddf = "Ken")
+
+geno.emm.by.Time = emmeans(SecNods, ~ Genotype|Time)
+
+ComparisonsTable <- as.data.frame(pwpm(geno.emm.by.Time))
+
+ComparisonsTable
+
+multcomp::cld(geno.emm.by.Time)
+
+write_xlsx(ComparisonsTable, "G:/My Drive/Clayton Carley Lab Book/SNAP/Growth Stage Paper/PairwiseComparisons_SecNods.xlsx")
+
+```
+
+## Figure 3
+
+```{r Figure 3}
+NodsTotalRoot <- roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(total_nods, na.rm=TRUE),.groups = "keep")
+
+TotRoot <- ggplot(NodsTotalRoot)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+  facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Average, Nodule~Count)))+
+  ggtitle("Nodule Count") + 
+  theme_bw() +
+  theme(legend.position = "none")
+  
+
+Tot_NodVol_Means_Farm <- roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(Total_Nod_Vol, na.rm=TRUE),.groups = "keep")
+
+AvgTotNodArea <- ggplot(Tot_NodVol_Means_Farm)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+    facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Average~Total, Nodule~Area~(mm^2))))+
+  ggtitle("Total Nodule Area") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+AvgTotNodInd_farm <- roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(all_avg_size_mm, na.rm=TRUE),.groups = "keep")
+
+All_AvgSizeMM <- ggplot(AvgTotNodInd_farm)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+    facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Average~Individual, Nodule~Area~(mm^2))))+
+  ggtitle("Area per Nodule") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+NodsOnTapRoot <- roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(on_tap_root, na.rm=TRUE),.groups = "keep")
+
+OnTapRoot <- ggplot(NodsOnTapRoot)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+  facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Average~Taproot, Nodule~Count)))+
+  ggtitle("Taproot Nodule Count") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+Tap_NodVol_Means_Farm <- roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(TapNodVol, na.rm=TRUE),.groups = "keep")
+
+AvgTapNodArea <- ggplot(Tap_NodVol_Means_Farm)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+    facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Avg~Total~Taproot, Nodule~Area~(mm^2))))+
+  ggtitle("Taproot Total Nodule Area") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+TapAvg_mm <- roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(tap_Avg_size_mm, na.rm=TRUE),.groups = "keep")
+
+TapAvg_MM <- ggplot(TapAvg_mm)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+    facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Avg~Individual~Taproot, Nodule~Area~(mm^2))))+
+  ggtitle("Area per Taproot Nodule") + 
+  theme_bw() +
+  theme(legend.position = "none")
+
+Figure3 <- plot_grid(TotRoot, All_AvgSizeMM, AvgTotNodArea,  OnTapRoot,  TapAvg_MM, AvgTapNodArea,  align = "hv", labels = c("AUTO"), nrow = 6) 
+
+#Legend building
+Figzz <- ggplot(NodsTotalRoot)+
+  aes(x=Time, y=MeanValue, group = FarmYear) +
+  facet_wrap(vars(Genotype), ncol = 6L) +
+  geom_line(aes(color=FarmYear)) +
+  geom_point(aes(color=FarmYear)) +
+  xlab("Growth Stage") +
+  ylab(bquote(atop(Avearge, Nodule~Count)))+
+  ggtitle("Avearge Nodule Count") + 
+  scale_color_discrete(name = "Environment", labels = c("S1", "S2", "S3")) +
+  theme_bw() +
+  theme(legend.position="bottom")
+ 
+
+legendzz <- get_legend(Figzz)
+
+Fig3Leg <- plot_grid(legendzz, nrow = 1)
+
+Figure3
+```
+
+#Data for Table 8 and S3
+#Build Figure 4
+
+```{r Figure 4 correlations}
+
+#build environmental averages. 
+
+#allnods
+roots$logTotNods <- log(roots$total_nods)
+farmyearavg <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(total_nods, na.rm=TRUE),.groups = "keep")
+farmyearavg <- rename(farmyearavg, totalNods = MeanValue)
+
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logTotNods, na.rm=TRUE),.groups = "keep")
+farmyearavg$logTotNods <- Filler$MeanValue
+
+#taproots
+roots$logTapNods <- log(roots$on_tap_root)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(on_tap_root, na.rm=TRUE),.groups = "keep")
+farmyearavg$OnTapRoot <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logTapNods, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogTapRoot <- Filler$MeanValue
+
+#secondary Roots
+roots$logSecNods <- log(roots$sec_nods+1)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(sec_nods, na.rm=TRUE),.groups = "keep")
+farmyearavg$SecNods <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logSecNods, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogSecNods <- Filler$MeanValue
+
+#rootBiomass
+roots$logRootBiomass <- log(roots$`Root_Dry_Mass(g)`)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(`Root_Dry_Mass(g)`, na.rm=TRUE),.groups = "keep")
+farmyearavg$RootBiomass <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logRootBiomass, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogRootBiomass <- Filler$MeanValue
+
+#ShootBiomass
+roots$logShootBiomass <- log(roots$`Shoot_Dry_Mass(g)`)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(`Shoot_Dry_Mass(g)`, na.rm=TRUE),.groups = "keep")
+farmyearavg$ShootBiomass <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logShootBiomass, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogShootBiomass <- Filler$MeanValue
+
+#TotalNodVol
+roots$logTotalVol <- log(roots$Total_Nod_Vol)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(Total_Nod_Vol, na.rm=TRUE),.groups = "keep")
+farmyearavg$TotalNodVol <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logTotalVol, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogTotalNodVol <- Filler$MeanValue
+
+#TapNodVol
+roots$logTapVol <- log(roots$TapNodVol)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(TapNodVol, na.rm=TRUE),.groups = "keep")
+farmyearavg$TapNodVol <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logTapVol, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogTapNodVol <- Filler$MeanValue
+
+#SecNodVol
+roots$logSecVol <- log(roots$SecNodVol)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(SecNodVol, na.rm=TRUE),.groups = "keep")
+farmyearavg$SecNodVol <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logSecVol, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogSecNodVol <- Filler$MeanValue
+
+#TotalNodSize
+roots$logTotalSize <- log(roots$all_avg_size_mm)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(all_avg_size_mm, na.rm=TRUE),.groups = "keep")
+farmyearavg$TotalNodSize <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logTotalSize, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogTotalNodSize <- Filler$MeanValue
+
+#TapNodSize
+roots$logTapSize <- log(roots$tap_Avg_size_mm)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(tap_Avg_size_mm, na.rm=TRUE),.groups = "keep")
+farmyearavg$TapNodSize <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logTapSize, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogTapNodSize <- Filler$MeanValue
+
+#SecNodSize
+roots$logSecSize <- log(roots$sec_Avg_Size_mm)
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(sec_Avg_Size_mm, na.rm=TRUE),.groups = "keep")
+farmyearavg$SecNodSize <- Filler$MeanValue
+Filler <-  roots %>% group_by(Genotype, Time, FarmYear)  %>% summarise(MeanValue = mean(logSecSize, na.rm=TRUE),.groups = "keep")
+farmyearavg$LogSecNodSize <- Filler$MeanValue
+
+#turn farmyearavg into long df
+
+LongFarmYearAvg <- farmyearavg %>% 
+ pivot_wider(
+    names_from = Time,
+    values_from = c(4:25)
+  )
+
+#Add the elelmental traits
+
+ELN.avg <- setNames(aggregate(list(ELN$`100 seed weight`, ELN$Nitrogen, ELN$Carbon, ELN$Hydrogen, ELN$Sulphur), by = list(ELN$Genotype...3, ELN$FarmYear), mean, na.rm = TRUE), c("Genotype", "FarmYear", "CWeight", "Nitrogen", "Carbon", "Hydrogen", "Sulpher"))
+
+ELN.Avg.Sorted <- ELN.avg[order(ELN.avg$Genotype, ELN.avg$FarmYear),]
+
+ELN.Avg.Sorted <- ELN.Avg.Sorted[c(3:7)]
+
+FarmYearAverages <- cbind(LongFarmYearAvg[-c(1:2)], ELN.Avg.Sorted) 
+
+
+#Subset to traits of interest
+
+TOI <- cbind(FarmYearAverages[c(7:9, 13:15, 19:21, 25:27, 37:39, 43:45,55:57, 61:63, 67:68)])
+
+
+#The TOI file was put in order using excel and changed the trait names form the coded names to the proper names for the paper. 
+
+TOI_Ordered <- read_excel("TOI_Ordered.xlsx")
+
+
+#Generate correlation matrix
+
+all.corpear <- rcorr(as.matrix(FarmYearAverages, type = "pearson"))
+
+all.corpear[["P"]][is.na(all.corpear[["P"]])] <- 0
+
+TOI.corpear <- rcorr(as.matrix(TOI_Ordered, type = "pearson"))
+
+TOI.corpear[["P"]][is.na(TOI.corpear[["P"]])] <- 0
+
+#Figure of all trait correlations
+corrplot(all.corpear$r, type="lower", order="alphabet", p.mat = all.corpear$P, sig.level = 0.1, insig = "blank", )
+
+#Figure of correlated traits of interest. 
+Figure4 <-{corrplot(TOI.corpear$r, type="lower", order="original", p.mat = TOI.corpear$P, sig.level = 0.1, insig = "blank", cl.ratio = 0.1, tl.srt = 45,); recordPlot()}
+Figure4
+```
+
+#Supplamental Figures 2, 3, and 4
+
+```{r supplamental Figure 2, 3, and 4}
+#Figure S2 % Nitrogen content in the seed
+ncont <- roots %>% group_by(Genotype, FarmYear)  %>% summarise(MeanValue = mean(Ncont, na.rm=TRUE),.groups = "keep")
+
+NitrogenConetnt <- ggplot(ncont) +
+ aes(x = FarmYear, y = MeanValue, group = Genotype) +
+ geom_line(aes(color=Genotype)) +
+ geom_point(aes(color=Genotype)) + 
+ scale_color_hue(direction = 1) +
+ xlab("Environment") +
+ ylab("% Nitrogen")+
+ ggtitle("Nitrogen Content in Mature Seed") + 
+ theme_minimal()
+
+NitrogenConetnt
+
+#Figure S3 Cwt of the seed at R8
+CwT <- roots %>% group_by(Genotype, FarmYear)  %>% summarise(MeanValue = mean(Cwt, na.rm=TRUE),.groups = "keep")
+
+SeedWeight <- ggplot(CwT) +
+ aes(x = FarmYear, y = MeanValue, group = Genotype) +
+ geom_line(aes(color=Genotype)) +
+ geom_point(aes(color=Genotype)) + 
+ scale_color_hue(direction = 1) +
+ xlab("Environment") +
+ ylab("Cwt")+
+ ggtitle("Seed 100 weight") + 
+ theme_minimal()
+
+SeedWeight
+
+#Figure S4 calculate and plot total nitrogen in 100 seeds
+roots$GramsNitrogen <- NA
+
+roots$GramsNitrogen <- roots$Ncont / 100 * roots$Cwt
+
+TotNcont <- roots %>% group_by(Genotype, FarmYear)  %>% summarise(MeanValue = mean(GramsNitrogen, na.rm=TRUE),.groups = "keep")
+
+TotNConetnt <- ggplot(TotNcont) +
+ aes(x = FarmYear, y = MeanValue, group = Genotype) +
+ geom_line(aes(color=Genotype)) +
+ geom_point(aes(color=Genotype)) + 
+ scale_color_hue(direction = 1) +
+ xlab("Environment") +
+ ylab("Grams Nitrogen per Cwt of Seed")+
+ ggtitle("Total Nitrogen in 100 Seeds") + 
+ theme_minimal()
+
+TotNConetnt
+```
+
+## Nodulation trait ANOVAs
+
+```{r Supplamental table S1 and S2}
+#Supplamental tables
+
+#Taproot and Non-taproot individual nodule area ANOVA Table S1
+SecNodsIndArea <- lmer(log(sec_Avg_Size_mm) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(SecNodsIndArea, ddf = "Ken")
+
+TapNodsIndArea <- lmer(log(tap_Avg_size_mm) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(TapNodsIndArea, ddf = "Ken")
+
+#Taproot and Non-taproot total nodule area (Nodulation) ANOVA Table S2
+SecNodsTotArea <- lmer(log(SecNodVol) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(SecNodsTotArea , ddf = "Ken")
+
+TapNodsTotArea <- lmer(log(TapNodVol) ~ Genotype*FarmYear*Time + (1|FarmYear:Time) + (1|FarmYear:Time:Rep), roots)
+anova(TapNodsTotArea, ddf = "Ken")
+```
+
+#AMMI Analysis and Figure S5
+```{r AMMI Plots Figure S5}
+rootsV1 <- subset(roots, roots$Time == "V1")
+rootsV3 <- subset(roots, roots$Time == "V3")
+rootsV5 <- subset(roots, roots$Time == "V5")
+
+TapVall <- performs_ammi(roots,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = on_tap_root,
+      verbose = FALSE)
+
+IndAreaAll <- performs_ammi(roots,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = tap_Avg_size_mm,
+      verbose = FALSE)
+
+TapNodArea <- performs_ammi(roots,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = TapNodVol,
+      verbose = FALSE)
+
+
+NTapV1 <- performs_ammi(rootsV1,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = sec_nods,
+      verbose = FALSE)
+
+NTapV3 <- performs_ammi(rootsV3,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = sec_nods,
+      verbose = FALSE)
+
+NTapV5 <- performs_ammi(rootsV5,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = sec_nods,
+      verbose = FALSE)
+
+
+V1nodulation <- performs_ammi(rootsV1,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = SecNodVol,
+      verbose = FALSE)
+
+V3nodulation <- performs_ammi(rootsV3,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = SecNodVol,
+      verbose = FALSE)
+
+V5nodulation <- performs_ammi(rootsV5,
+      env = FarmYear,
+      gen = Genotype,
+      rep = Rep_FarmYear,
+      resp = SecNodVol,
+      verbose = FALSE)
+
+
+TapAllFig <- plot_scores(TapVall, axis.expand = 1.5,
+                  title = "False",
+                  x.lab = "Taproot Nodules")
+
+IndFig <- plot_scores(IndAreaAll, axis.expand = 1.5,
+                  title = "False",
+                  x.lab = "Taproot Ind Area")
+
+AreaFig <- plot_scores(TapNodArea, axis.expand = 1.5,
+                  title = "False",
+                  x.lab = "Taproot Total Area")
+
+NV1 <- plot_scores(NTapV1, axis.expand = 1.5,
+                  title = "False",
+                  x.lab = "Non-Taproot Nodules")
+NV3 <- plot_scores(NTapV3, axis.expand = 1.5,
+                   title = "False",
+                  x.lab = "Non-Taproot Nodules")
+NV5 <- plot_scores(NTapV5, axis.expand = 1.5,
+                   title = "False",
+                  x.lab = "Non-Taproot Nodules")
+
+V1area <- plot_scores(NTapV1, axis.expand = 1.5,
+                  title = "False",
+                  x.lab = "V1 Non-Taproot Nodulation")
+V3area <- plot_scores(NTapV3, axis.expand = 1.5,
+                   title = "False",
+                  x.lab = "V3 Non-Taproot Nodulation")
+V5area <- plot_scores(NTapV5, axis.expand = 1.5,
+                   title = "False",
+                  x.lab = "V5 Non-Taproot Nodulation")
+
+FigureS5 <- plot_grid(TapAllFig, IndFig, AreaFig, V1area, V3area, V5area, labels ="auto", align = "hv", nrow = 2) 
+FigureS5
+```
